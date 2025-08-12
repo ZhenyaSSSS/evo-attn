@@ -1,13 +1,3 @@
-# EvoAttn package
-
-See the root `README.md` and `README_RU.md` for full documentation.
-
-Minimal usage:
-
-```python
-from evo_attn import EvoAttn, evo_attn
-```
-
 ## EvoAttention (Triton + Torch fallback)
 
 [Русская версия README](README_RU.md)
