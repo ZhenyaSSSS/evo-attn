@@ -1,0 +1,45 @@
+[build-system]
+requires = ["setuptools>=61", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "evo-attn"
+version = "0.1.0"
+description = "High-performance EvoAttention (causal and non-causal) with Triton kernels and Torch fallback"
+readme = "README.md"
+requires-python = ">=3.10"
+license = { text = "Apache-2.0" }
+authors = [
+  { name = "Eugeny Sautkin", email = "evgenijsautkin29@gmail.com" }
+]
+keywords = ["attention", "triton", "pytorch", "evo", "transformer"]
+classifiers = [
+  "Programming Language :: Python :: 3",
+  "License :: OSI Approved :: Apache Software License",
+  "Operating System :: OS Independent",
+]
+dependencies = [
+  "torch>=2.1",
+  # Triton is optional; on unsupported platforms users can still use torch fallback.
+  # "triton>=2.1",
+]
+
+[project.optional-dependencies]
+triton = ["triton>=2.1"]
+dev = [
+  "pytest>=7",
+  "pytest-cov>=4",
+  "ruff>=0.4.0",
+  "mypy>=1.8.0",
+]
+
+[tool.setuptools]
+packages = ["evo_attn"]
+
+[tool.setuptools.package-dir]
+evo_attn = "."
+
+[tool.ruff]
+line-length = 100
+target-version = "py310"
+
