@@ -65,103 +65,103 @@ if _TRITON_AVAILABLE:
         pid_b = tl.program_id(0)
         pid_h = tl.program_id(1)
 
-    q_ptr = Q + pid_b * stride_qb + pid_h * stride_qh
-    k_ptr = K + pid_b * stride_kb + pid_h * stride_kh
-    v_ptr = V + pid_b * stride_vb + pid_h * stride_vh
-    out_ptr = Out + pid_b * stride_ob + pid_h * stride_oh
-    cp_base_ptr = CarryPrefix + pid_b * stride_cpb + pid_h * stride_cph
+        q_ptr = Q + pid_b * stride_qb + pid_h * stride_qh
+        k_ptr = K + pid_b * stride_kb + pid_h * stride_kh
+        v_ptr = V + pid_b * stride_vb + pid_h * stride_vh
+        out_ptr = Out + pid_b * stride_ob + pid_h * stride_oh
+        cp_base_ptr = CarryPrefix + pid_b * stride_cpb + pid_h * stride_cph
 
-    offsets_d = tl.arange(0, BLOCK_SIZE_D)
-    DTYPE = tl.float64 if ACCUM_FP64 else tl.float32
-    if CAUSAL:
-        carry_sum = tl.zeros([BLOCK_SIZE_D], dtype=DTYPE)
-        carry_comp = tl.zeros([BLOCK_SIZE_D], dtype=DTYPE)
+        offsets_d = tl.arange(0, BLOCK_SIZE_D)
+        DTYPE = tl.float64 if ACCUM_FP64 else tl.float32
+        if CAUSAL:
+            carry_sum = tl.zeros([BLOCK_SIZE_D], dtype=DTYPE)
+            carry_comp = tl.zeros([BLOCK_SIZE_D], dtype=DTYPE)
 
-        block_idx = 0
-        for start_m in range(0, seq_len, BLOCK_SIZE_M):
-            offsets_m = start_m + tl.arange(0, BLOCK_SIZE_M)
-            mask_m = offsets_m < seq_len
+            block_idx = 0
+            for start_m in range(0, seq_len, BLOCK_SIZE_M):
+                offsets_m = start_m + tl.arange(0, BLOCK_SIZE_M)
+                mask_m = offsets_m < seq_len
 
-            # store prefix before processing this block
-            cp_ptr = cp_base_ptr + block_idx * stride_cpm
-            tl.store(cp_ptr + offsets_d * stride_cpd, carry_sum.to(CarryPrefix.dtype.element_ty))
+                # store prefix before processing this block
+                cp_ptr = cp_base_ptr + block_idx * stride_cpm
+                tl.store(cp_ptr + offsets_d * stride_cpd, carry_sum.to(CarryPrefix.dtype.element_ty))
 
-            q = tl.load(q_ptr + offsets_m[:, None] * stride_qm + offsets_d[None, :] * stride_qk, mask=mask_m[:, None], other=0.0).to(DTYPE)
-            k = tl.load(k_ptr + offsets_m[:, None] * stride_km + offsets_d[None, :] * stride_kk, mask=mask_m[:, None], other=0.0).to(DTYPE)
-            v = tl.load(v_ptr + offsets_m[:, None] * stride_vm + offsets_d[None, :] * stride_vk, mask=mask_m[:, None], other=0.0).to(DTYPE)
+                q = tl.load(q_ptr + offsets_m[:, None] * stride_qm + offsets_d[None, :] * stride_qk, mask=mask_m[:, None], other=0.0).to(DTYPE)
+                k = tl.load(k_ptr + offsets_m[:, None] * stride_km + offsets_d[None, :] * stride_kk, mask=mask_m[:, None], other=0.0).to(DTYPE)
+                v = tl.load(v_ptr + offsets_m[:, None] * stride_vm + offsets_d[None, :] * stride_vk, mask=mask_m[:, None], other=0.0).to(DTYPE)
 
-            sig_v = tl.sigmoid(v)
-            v_silu = v * sig_v
-            v_swiglu = v_silu * v
+                sig_v = tl.sigmoid(v)
+                v_silu = v * sig_v
+                v_swiglu = v_silu * v
 
-            local_cumsum = tl.cumsum(v_swiglu, axis=0)
-            compensated_local = local_cumsum - carry_comp[None, :]
-            temp_sum = carry_sum[None, :] + compensated_local
-            new_comp = (temp_sum - carry_sum[None, :]) - compensated_local
+                local_cumsum = tl.cumsum(v_swiglu, axis=0)
+                compensated_local = local_cumsum - carry_comp[None, :]
+                temp_sum = carry_sum[None, :] + compensated_local
+                new_comp = (temp_sum - carry_sum[None, :]) - compensated_local
 
-            c_block = temp_sum
-            carry_sum += tl.sum(v_swiglu, axis=0)
-            carry_comp += tl.sum(new_comp, axis=0)
+                c_block = temp_sum
+                carry_sum += tl.sum(v_swiglu, axis=0)
+                carry_comp += tl.sum(new_comp, axis=0)
 
-            # RMSNorm(c)
-            c_var = tl.sum(c_block * c_block, axis=1) / head_dim
-            inv_rms_c = tl.rsqrt(c_var + 1e-5)
-            c_n = c_block * inv_rms_c[:, None]
+                # RMSNorm(c)
+                c_var = tl.sum(c_block * c_block, axis=1) / head_dim
+                inv_rms_c = tl.rsqrt(c_var + 1e-5)
+                c_n = c_block * inv_rms_c[:, None]
 
-            # r = ||Q|| + ||K|| + 1
-            l2_q = tl.sqrt(tl.sum(q * q, axis=1) + 1e-8)
-            l2_k = tl.sqrt(tl.sum(k * k, axis=1) + 1e-8)
-            r = l2_q + l2_k + 1.0
+                # r = ||Q|| + ||K|| + 1
+                l2_q = tl.sqrt(tl.sum(q * q, axis=1) + 1e-8)
+                l2_k = tl.sqrt(tl.sum(k * k, axis=1) + 1e-8)
+                r = l2_q + l2_k + 1.0
 
-            mstate = c_n / r[:, None]
-            g = mstate * tl.sigmoid(mstate)
-            o0 = v + g * v
+                mstate = c_n / r[:, None]
+                g = mstate * tl.sigmoid(mstate)
+                o0 = v + g * v
 
-            out_var = tl.sum(o0 * o0, axis=1) / head_dim
-            inv_rms_out = tl.rsqrt(out_var + 1e-5)
-            out = o0 * inv_rms_out[:, None]
+                out_var = tl.sum(o0 * o0, axis=1) / head_dim
+                inv_rms_out = tl.rsqrt(out_var + 1e-5)
+                out = o0 * inv_rms_out[:, None]
 
-            tl.store(out_ptr + offsets_m[:, None] * stride_om + offsets_d[None, :] * stride_ok, out.to(Out.dtype.element_ty), mask=mask_m[:, None])
+                tl.store(out_ptr + offsets_m[:, None] * stride_om + offsets_d[None, :] * stride_ok, out.to(Out.dtype.element_ty), mask=mask_m[:, None])
 
-            block_idx += 1
-    else:
-        # Pass 1: accumulate global C_total = sum_t swiglu(V[t])
-        global_sum = tl.zeros([BLOCK_SIZE_D], dtype=DTYPE)
-        for start_m in range(0, seq_len, BLOCK_SIZE_M):
-            offsets_m = start_m + tl.arange(0, BLOCK_SIZE_M)
-            mask_m = offsets_m < seq_len
-            v = tl.load(v_ptr + offsets_m[:, None] * stride_vm + offsets_d[None, :] * stride_vk, mask=mask_m[:, None], other=0.0).to(DTYPE)
-            sig_v = tl.sigmoid(v)
-            v_silu = v * sig_v
-            v_swiglu = v_silu * v
-            global_sum += tl.sum(v_swiglu, axis=0)
+                block_idx += 1
+        else:
+            # Pass 1: accumulate global C_total = sum_t swiglu(V[t])
+            global_sum = tl.zeros([BLOCK_SIZE_D], dtype=DTYPE)
+            for start_m in range(0, seq_len, BLOCK_SIZE_M):
+                offsets_m = start_m + tl.arange(0, BLOCK_SIZE_M)
+                mask_m = offsets_m < seq_len
+                v = tl.load(v_ptr + offsets_m[:, None] * stride_vm + offsets_d[None, :] * stride_vk, mask=mask_m[:, None], other=0.0).to(DTYPE)
+                sig_v = tl.sigmoid(v)
+                v_silu = v * sig_v
+                v_swiglu = v_silu * v
+                global_sum += tl.sum(v_swiglu, axis=0)
 
-        # Normalize global c
-        c_var_g = tl.sum(global_sum * global_sum) / head_dim
-        inv_rms_c_g = tl.rsqrt(c_var_g + 1e-5)
-        c_n_vec = global_sum * inv_rms_c_g
+            # Normalize global c
+            c_var_g = tl.sum(global_sum * global_sum) / head_dim
+            inv_rms_c_g = tl.rsqrt(c_var_g + 1e-5)
+            c_n_vec = global_sum * inv_rms_c_g
 
-        # Pass 2: compute outputs using the same c for all rows
-        for start_m in range(0, seq_len, BLOCK_SIZE_M):
-            offsets_m = start_m + tl.arange(0, BLOCK_SIZE_M)
-            mask_m = offsets_m < seq_len
-            q = tl.load(q_ptr + offsets_m[:, None] * stride_qm + offsets_d[None, :] * stride_qk, mask=mask_m[:, None], other=0.0).to(DTYPE)
-            k = tl.load(k_ptr + offsets_m[:, None] * stride_km + offsets_d[None, :] * stride_kk, mask=mask_m[:, None], other=0.0).to(DTYPE)
-            v = tl.load(v_ptr + offsets_m[:, None] * stride_vm + offsets_d[None, :] * stride_vk, mask=mask_m[:, None], other=0.0).to(DTYPE)
+            # Pass 2: compute outputs using the same c for all rows
+            for start_m in range(0, seq_len, BLOCK_SIZE_M):
+                offsets_m = start_m + tl.arange(0, BLOCK_SIZE_M)
+                mask_m = offsets_m < seq_len
+                q = tl.load(q_ptr + offsets_m[:, None] * stride_qm + offsets_d[None, :] * stride_qk, mask=mask_m[:, None], other=0.0).to(DTYPE)
+                k = tl.load(k_ptr + offsets_m[:, None] * stride_km + offsets_d[None, :] * stride_kk, mask=mask_m[:, None], other=0.0).to(DTYPE)
+                v = tl.load(v_ptr + offsets_m[:, None] * stride_vm + offsets_d[None, :] * stride_vk, mask=mask_m[:, None], other=0.0).to(DTYPE)
 
-            l2_q = tl.sqrt(tl.sum(q * q, axis=1) + 1e-8)
-            l2_k = tl.sqrt(tl.sum(k * k, axis=1) + 1e-8)
-            r = l2_q + l2_k + 1.0
+                l2_q = tl.sqrt(tl.sum(q * q, axis=1) + 1e-8)
+                l2_k = tl.sqrt(tl.sum(k * k, axis=1) + 1e-8)
+                r = l2_q + l2_k + 1.0
 
-            mstate = c_n_vec[None, :] / r[:, None]
-            g = mstate * tl.sigmoid(mstate)
-            o0 = v + g * v
+                mstate = c_n_vec[None, :] / r[:, None]
+                g = mstate * tl.sigmoid(mstate)
+                o0 = v + g * v
 
-            out_var = tl.sum(o0 * o0, axis=1) / head_dim
-            inv_rms_out = tl.rsqrt(out_var + 1e-5)
-            out = o0 * inv_rms_out[:, None]
+                out_var = tl.sum(o0 * o0, axis=1) / head_dim
+                inv_rms_out = tl.rsqrt(out_var + 1e-5)
+                out = o0 * inv_rms_out[:, None]
 
-            tl.store(out_ptr + offsets_m[:, None] * stride_om + offsets_d[None, :] * stride_ok, out.to(Out.dtype.element_ty), mask=mask_m[:, None])
+                tl.store(out_ptr + offsets_m[:, None] * stride_om + offsets_d[None, :] * stride_ok, out.to(Out.dtype.element_ty), mask=mask_m[:, None])
 
 
     @triton.jit
@@ -185,175 +185,175 @@ if _TRITON_AVAILABLE:
         pid_b = tl.program_id(0)
         pid_h = tl.program_id(1)
 
-    q_ptr = Q + pid_b * stride_qb + pid_h * stride_qh
-    k_ptr = K + pid_b * stride_kb + pid_h * stride_kh
-    v_ptr = V + pid_b * stride_vb + pid_h * stride_vh
-    dy_ptr = dOut + pid_b * stride_dyb + pid_h * stride_dyh
+        q_ptr = Q + pid_b * stride_qb + pid_h * stride_qh
+        k_ptr = K + pid_b * stride_kb + pid_h * stride_kh
+        v_ptr = V + pid_b * stride_vb + pid_h * stride_vh
+        dy_ptr = dOut + pid_b * stride_dyb + pid_h * stride_dyh
 
-    dq_ptr = dQ + pid_b * stride_dqb + pid_h * stride_dqh
-    dk_ptr = dK + pid_b * stride_dkb + pid_h * stride_dkh
-    dv_ptr = dV + pid_b * stride_dvb + pid_h * stride_dvh
+        dq_ptr = dQ + pid_b * stride_dqb + pid_h * stride_dqh
+        dk_ptr = dK + pid_b * stride_dkb + pid_h * stride_dkh
+        dv_ptr = dV + pid_b * stride_dvb + pid_h * stride_dvh
 
-    cp_base_ptr = CarryPrefix + pid_b * stride_cpb + pid_h * stride_cph
+        cp_base_ptr = CarryPrefix + pid_b * stride_cpb + pid_h * stride_cph
 
-    offsets_d = tl.arange(0, BLOCK_SIZE_D)
-    DTYPE = tl.float64 if ACCUM_FP64 else tl.float32
-    if CAUSAL:
-        carry_grad_c = tl.zeros([BLOCK_SIZE_D], dtype=DTYPE)
+        offsets_d = tl.arange(0, BLOCK_SIZE_D)
+        DTYPE = tl.float64 if ACCUM_FP64 else tl.float32
+        if CAUSAL:
+            carry_grad_c = tl.zeros([BLOCK_SIZE_D], dtype=DTYPE)
 
-        aligned_end = ((seq_len + BLOCK_SIZE_M - 1) // BLOCK_SIZE_M) * BLOCK_SIZE_M
-        for start_m in range(aligned_end - BLOCK_SIZE_M, -BLOCK_SIZE_M, -BLOCK_SIZE_M):
-            offsets_m = start_m + tl.arange(0, BLOCK_SIZE_M)
-            mask_m = (offsets_m >= 0) & (offsets_m < seq_len)
+            aligned_end = ((seq_len + BLOCK_SIZE_M - 1) // BLOCK_SIZE_M) * BLOCK_SIZE_M
+            for start_m in range(aligned_end - BLOCK_SIZE_M, -BLOCK_SIZE_M, -BLOCK_SIZE_M):
+                offsets_m = start_m + tl.arange(0, BLOCK_SIZE_M)
+                mask_m = (offsets_m >= 0) & (offsets_m < seq_len)
 
-            q = tl.load(q_ptr + offsets_m[:, None] * stride_qm + offsets_d[None, :] * stride_qk, mask=mask_m[:, None], other=0.0).to(DTYPE)
-            k = tl.load(k_ptr + offsets_m[:, None] * stride_km + offsets_d[None, :] * stride_kk, mask=mask_m[:, None], other=0.0).to(DTYPE)
-            v = tl.load(v_ptr + offsets_m[:, None] * stride_vm + offsets_d[None, :] * stride_vk, mask=mask_m[:, None], other=0.0).to(DTYPE)
-            dy = tl.load(dy_ptr + offsets_m[:, None] * stride_dym + offsets_d[None, :] * stride_dyk, mask=mask_m[:, None], other=0.0).to(DTYPE)
+                q = tl.load(q_ptr + offsets_m[:, None] * stride_qm + offsets_d[None, :] * stride_qk, mask=mask_m[:, None], other=0.0).to(DTYPE)
+                k = tl.load(k_ptr + offsets_m[:, None] * stride_km + offsets_d[None, :] * stride_kk, mask=mask_m[:, None], other=0.0).to(DTYPE)
+                v = tl.load(v_ptr + offsets_m[:, None] * stride_vm + offsets_d[None, :] * stride_vk, mask=mask_m[:, None], other=0.0).to(DTYPE)
+                dy = tl.load(dy_ptr + offsets_m[:, None] * stride_dym + offsets_d[None, :] * stride_dyk, mask=mask_m[:, None], other=0.0).to(DTYPE)
 
-            block_index = start_m // BLOCK_SIZE_M
-            cp_ptr = cp_base_ptr + block_index * stride_cpm
-            prefix = tl.load(cp_ptr + offsets_d * stride_cpd).to(DTYPE)
+                block_index = start_m // BLOCK_SIZE_M
+                cp_ptr = cp_base_ptr + block_index * stride_cpm
+                prefix = tl.load(cp_ptr + offsets_d * stride_cpd).to(DTYPE)
 
-            sig_v = tl.sigmoid(v)
-            v_silu = v * sig_v
-            v_swiglu = v_silu * v
-            local_cumsum = tl.cumsum(v_swiglu, axis=0)
-            c_block = local_cumsum + prefix[None, :]
+                sig_v = tl.sigmoid(v)
+                v_silu = v * sig_v
+                v_swiglu = v_silu * v
+                local_cumsum = tl.cumsum(v_swiglu, axis=0)
+                c_block = local_cumsum + prefix[None, :]
 
-            c_var = tl.sum(c_block * c_block, axis=1) / head_dim
-            inv_rms_c = tl.rsqrt(c_var + 1e-5)
-            c_n = c_block * inv_rms_c[:, None]
+                c_var = tl.sum(c_block * c_block, axis=1) / head_dim
+                inv_rms_c = tl.rsqrt(c_var + 1e-5)
+                c_n = c_block * inv_rms_c[:, None]
 
-            l2_q = tl.sqrt(tl.sum(q * q, axis=1) + 1e-8)
-            l2_k = tl.sqrt(tl.sum(k * k, axis=1) + 1e-8)
-            r = l2_q + l2_k + 1.0
+                l2_q = tl.sqrt(tl.sum(q * q, axis=1) + 1e-8)
+                l2_k = tl.sqrt(tl.sum(k * k, axis=1) + 1e-8)
+                r = l2_q + l2_k + 1.0
 
-            mstate = c_n / r[:, None]
-            sig_m = tl.sigmoid(mstate)
-            g = mstate * sig_m
-            o0 = v * (1.0 + g)
+                mstate = c_n / r[:, None]
+                sig_m = tl.sigmoid(mstate)
+                g = mstate * sig_m
+                o0 = v * (1.0 + g)
 
-            out_var = tl.sum(o0 * o0, axis=1) / head_dim
-            inv_rms_out = tl.rsqrt(out_var + 1e-5)
-            out_y = o0 * inv_rms_out[:, None]
+                out_var = tl.sum(o0 * o0, axis=1) / head_dim
+                inv_rms_out = tl.rsqrt(out_var + 1e-5)
+                out_y = o0 * inv_rms_out[:, None]
 
-            # d out -> d o0 (RMSNorm bwd)
-            mean_dy_y = tl.sum(dy * out_y, axis=1) / head_dim
-            do0 = inv_rms_out[:, None] * (dy - out_y * mean_dy_y[:, None])
+                # d out -> d o0 (RMSNorm bwd)
+                mean_dy_y = tl.sum(dy * out_y, axis=1) / head_dim
+                do0 = inv_rms_out[:, None] * (dy - out_y * mean_dy_y[:, None])
 
-            # через o0 = v * (1 + g)
-            dV_from_o0 = do0 * (1.0 + g)
-            dg = do0 * v
+                # через o0 = v * (1 + g)
+                dV_from_o0 = do0 * (1.0 + g)
+                dg = do0 * v
 
-            # через g = SiLU(mstate)
-            dsilu_m = sig_m * (1.0 + mstate * (1.0 - sig_m))
-            dmstate = dg * dsilu_m
+                # через g = SiLU(mstate)
+                dsilu_m = sig_m * (1.0 + mstate * (1.0 - sig_m))
+                dmstate = dg * dsilu_m
 
-            # mstate = c_n / r
-            dc_n = dmstate / r[:, None]
-            dr = - tl.sum(dmstate * c_n, axis=1) / (r * r)
+                # mstate = c_n / r
+                dc_n = dmstate / r[:, None]
+                dr = - tl.sum(dmstate * c_n, axis=1) / (r * r)
 
-            # RMSNorm(c) bwd
-            mean_dcny = tl.sum(dc_n * c_n, axis=1) / head_dim
-            dc = inv_rms_c[:, None] * (dc_n - c_n * mean_dcny[:, None])
+                # RMSNorm(c) bwd
+                mean_dcny = tl.sum(dc_n * c_n, axis=1) / head_dim
+                dc = inv_rms_c[:, None] * (dc_n - c_n * mean_dcny[:, None])
 
-            # dv_sw via vectorized suffix-sum: s[i] = sum_{j=i}^{M-1} dc[j]
-            dsilu_v = sig_v * (1.0 + v * (1.0 - sig_v))
-            dc = tl.where(mask_m[:, None], dc, 0.0)
-            sum_dc = tl.sum(dc, axis=0)
-            prefix_dc = tl.cumsum(dc, axis=0)
-            dv_sw = (sum_dc[None, :] - prefix_dc + dc) + carry_grad_c[None, :]
-            dv_from_vsw = dv_sw * (dsilu_v * v + v_silu)
-            dV_block = dV_from_o0 + dv_from_vsw
-            tl.store(dv_ptr + offsets_m[:, None] * stride_dvm + offsets_d[None, :] * stride_dvk, dV_block.to(dV.dtype.element_ty), mask=mask_m[:, None])
-            carry_grad_c = carry_grad_c + sum_dc
+                # dv_sw via vectorized suffix-sum: s[i] = sum_{j=i}^{M-1} dc[j]
+                dsilu_v = sig_v * (1.0 + v * (1.0 - sig_v))
+                dc = tl.where(mask_m[:, None], dc, 0.0)
+                sum_dc = tl.sum(dc, axis=0)
+                prefix_dc = tl.cumsum(dc, axis=0)
+                dv_sw = (sum_dc[None, :] - prefix_dc + dc) + carry_grad_c[None, :]
+                dv_from_vsw = dv_sw * (dsilu_v * v + v_silu)
+                dV_block = dV_from_o0 + dv_from_vsw
+                tl.store(dv_ptr + offsets_m[:, None] * stride_dvm + offsets_d[None, :] * stride_dvk, dV_block.to(dV.dtype.element_ty), mask=mask_m[:, None])
+                carry_grad_c = carry_grad_c + sum_dc
 
-            # d r -> dQ, dK (blockwise)
-            dQ_block = tl.where(l2_q[:, None] > 0.0, dr[:, None] * (q / l2_q[:, None]), 0.0)
-            dK_block = tl.where(l2_k[:, None] > 0.0, dr[:, None] * (k / l2_k[:, None]), 0.0)
+                # d r -> dQ, dK (blockwise)
+                dQ_block = tl.where(l2_q[:, None] > 0.0, dr[:, None] * (q / l2_q[:, None]), 0.0)
+                dK_block = tl.where(l2_k[:, None] > 0.0, dr[:, None] * (k / l2_k[:, None]), 0.0)
 
-            tl.store(dq_ptr + offsets_m[:, None] * stride_dqm + offsets_d[None, :] * stride_dqk, dQ_block.to(dQ.dtype.element_ty), mask=mask_m[:, None])
-            tl.store(dk_ptr + offsets_m[:, None] * stride_dkm + offsets_d[None, :] * stride_dkk, dK_block.to(dK.dtype.element_ty), mask=mask_m[:, None])
-    else:
-        # Non-causal backward in 3 passes
-        # Pass 1: accumulate global C_total
-        global_sum = tl.zeros([BLOCK_SIZE_D], dtype=DTYPE)
-        for start_m in range(0, seq_len, BLOCK_SIZE_M):
-            offsets_m = start_m + tl.arange(0, BLOCK_SIZE_M)
-            mask_m = offsets_m < seq_len
-            v = tl.load(v_ptr + offsets_m[:, None] * stride_vm + offsets_d[None, :] * stride_vk, mask=mask_m[:, None], other=0.0).to(DTYPE)
-            sig_v = tl.sigmoid(v)
-            v_silu = v * sig_v
-            v_swiglu = v_silu * v
-            global_sum += tl.sum(v_swiglu, axis=0)
+                tl.store(dq_ptr + offsets_m[:, None] * stride_dqm + offsets_d[None, :] * stride_dqk, dQ_block.to(dQ.dtype.element_ty), mask=mask_m[:, None])
+                tl.store(dk_ptr + offsets_m[:, None] * stride_dkm + offsets_d[None, :] * stride_dkk, dK_block.to(dK.dtype.element_ty), mask=mask_m[:, None])
+        else:
+            # Non-causal backward in 3 passes
+            # Pass 1: accumulate global C_total
+            global_sum = tl.zeros([BLOCK_SIZE_D], dtype=DTYPE)
+            for start_m in range(0, seq_len, BLOCK_SIZE_M):
+                offsets_m = start_m + tl.arange(0, BLOCK_SIZE_M)
+                mask_m = offsets_m < seq_len
+                v = tl.load(v_ptr + offsets_m[:, None] * stride_vm + offsets_d[None, :] * stride_vk, mask=mask_m[:, None], other=0.0).to(DTYPE)
+                sig_v = tl.sigmoid(v)
+                v_silu = v * sig_v
+                v_swiglu = v_silu * v
+                global_sum += tl.sum(v_swiglu, axis=0)
 
-        c_var_g = tl.sum(global_sum * global_sum) / head_dim
-        inv_rms_c_g = tl.rsqrt(c_var_g + 1e-5)
-        c_n_vec = global_sum * inv_rms_c_g
+            c_var_g = tl.sum(global_sum * global_sum) / head_dim
+            inv_rms_c_g = tl.rsqrt(c_var_g + 1e-5)
+            c_n_vec = global_sum * inv_rms_c_g
 
-        sum_dc_global = tl.zeros([BLOCK_SIZE_D], dtype=DTYPE)
+            sum_dc_global = tl.zeros([BLOCK_SIZE_D], dtype=DTYPE)
 
-        # Pass 2: compute do0 path, dQ/dK, partial dV_from_o0 and accumulate sum(dc)
-        for start_m in range(0, seq_len, BLOCK_SIZE_M):
-            offsets_m = start_m + tl.arange(0, BLOCK_SIZE_M)
-            mask_m = offsets_m < seq_len
+            # Pass 2: compute do0 path, dQ/dK, partial dV_from_o0 and accumulate sum(dc)
+            for start_m in range(0, seq_len, BLOCK_SIZE_M):
+                offsets_m = start_m + tl.arange(0, BLOCK_SIZE_M)
+                mask_m = offsets_m < seq_len
 
-            q = tl.load(q_ptr + offsets_m[:, None] * stride_qm + offsets_d[None, :] * stride_qk, mask=mask_m[:, None], other=0.0).to(DTYPE)
-            k = tl.load(k_ptr + offsets_m[:, None] * stride_km + offsets_d[None, :] * stride_kk, mask=mask_m[:, None], other=0.0).to(DTYPE)
-            v = tl.load(v_ptr + offsets_m[:, None] * stride_vm + offsets_d[None, :] * stride_vk, mask=mask_m[:, None], other=0.0).to(DTYPE)
-            dy = tl.load(dy_ptr + offsets_m[:, None] * stride_dym + offsets_d[None, :] * stride_dyk, mask=mask_m[:, None], other=0.0).to(DTYPE)
+                q = tl.load(q_ptr + offsets_m[:, None] * stride_qm + offsets_d[None, :] * stride_qk, mask=mask_m[:, None], other=0.0).to(DTYPE)
+                k = tl.load(k_ptr + offsets_m[:, None] * stride_km + offsets_d[None, :] * stride_kk, mask=mask_m[:, None], other=0.0).to(DTYPE)
+                v = tl.load(v_ptr + offsets_m[:, None] * stride_vm + offsets_d[None, :] * stride_vk, mask=mask_m[:, None], other=0.0).to(DTYPE)
+                dy = tl.load(dy_ptr + offsets_m[:, None] * stride_dym + offsets_d[None, :] * stride_dyk, mask=mask_m[:, None], other=0.0).to(DTYPE)
 
-            l2_q = tl.sqrt(tl.sum(q * q, axis=1) + 1e-8)
-            l2_k = tl.sqrt(tl.sum(k * k, axis=1) + 1e-8)
-            r = l2_q + l2_k + 1.0
+                l2_q = tl.sqrt(tl.sum(q * q, axis=1) + 1e-8)
+                l2_k = tl.sqrt(tl.sum(k * k, axis=1) + 1e-8)
+                r = l2_q + l2_k + 1.0
 
-            mstate = c_n_vec[None, :] / r[:, None]
-            sig_m = tl.sigmoid(mstate)
-            g = mstate * sig_m
-            o0 = v * (1.0 + g)
+                mstate = c_n_vec[None, :] / r[:, None]
+                sig_m = tl.sigmoid(mstate)
+                g = mstate * sig_m
+                o0 = v * (1.0 + g)
 
-            out_var = tl.sum(o0 * o0, axis=1) / head_dim
-            inv_rms_out = tl.rsqrt(out_var + 1e-5)
-            out_y = o0 * inv_rms_out[:, None]
+                out_var = tl.sum(o0 * o0, axis=1) / head_dim
+                inv_rms_out = tl.rsqrt(out_var + 1e-5)
+                out_y = o0 * inv_rms_out[:, None]
 
-            mean_dy_y = tl.sum(dy * out_y, axis=1) / head_dim
-            do0 = inv_rms_out[:, None] * (dy - out_y * mean_dy_y[:, None])
+                mean_dy_y = tl.sum(dy * out_y, axis=1) / head_dim
+                do0 = inv_rms_out[:, None] * (dy - out_y * mean_dy_y[:, None])
 
-            dV_from_o0 = do0 * (1.0 + g)
-            tl.store(dv_ptr + offsets_m[:, None] * stride_dvm + offsets_d[None, :] * stride_dvk, dV_from_o0.to(dV.dtype.element_ty), mask=mask_m[:, None])
+                dV_from_o0 = do0 * (1.0 + g)
+                tl.store(dv_ptr + offsets_m[:, None] * stride_dvm + offsets_d[None, :] * stride_dvk, dV_from_o0.to(dV.dtype.element_ty), mask=mask_m[:, None])
 
-            dg = do0 * v
-            dsilu_m = sig_m * (1.0 + mstate * (1.0 - sig_m))
-            dmstate = dg * dsilu_m
+                dg = do0 * v
+                dsilu_m = sig_m * (1.0 + mstate * (1.0 - sig_m))
+                dmstate = dg * dsilu_m
 
-            dc_n = dmstate / r[:, None]
-            dr = - tl.sum(dmstate * c_n_vec[None, :], axis=1) / (r * r)
+                dc_n = dmstate / r[:, None]
+                dr = - tl.sum(dmstate * c_n_vec[None, :], axis=1) / (r * r)
 
-            # RMSNorm(c) bwd with global c
-            mean_dcny = tl.sum(dc_n * c_n_vec[None, :], axis=1) / head_dim
-            dc = inv_rms_c_g * (dc_n - c_n_vec[None, :] * mean_dcny[:, None])
-            dc = tl.where(mask_m[:, None], dc, 0.0)
-            sum_dc_global += tl.sum(dc, axis=0)
+                # RMSNorm(c) bwd with global c
+                mean_dcny = tl.sum(dc_n * c_n_vec[None, :], axis=1) / head_dim
+                dc = inv_rms_c_g * (dc_n - c_n_vec[None, :] * mean_dcny[:, None])
+                dc = tl.where(mask_m[:, None], dc, 0.0)
+                sum_dc_global += tl.sum(dc, axis=0)
 
-            dQ_block = tl.where(l2_q[:, None] > 0.0, dr[:, None] * (q / l2_q[:, None]), 0.0)
-            dK_block = tl.where(l2_k[:, None] > 0.0, dr[:, None] * (k / l2_k[:, None]), 0.0)
-            tl.store(dq_ptr + offsets_m[:, None] * stride_dqm + offsets_d[None, :] * stride_dqk, dQ_block.to(dQ.dtype.element_ty), mask=mask_m[:, None])
-            tl.store(dk_ptr + offsets_m[:, None] * stride_dkm + offsets_d[None, :] * stride_dkk, dK_block.to(dK.dtype.element_ty), mask=mask_m[:, None])
+                dQ_block = tl.where(l2_q[:, None] > 0.0, dr[:, None] * (q / l2_q[:, None]), 0.0)
+                dK_block = tl.where(l2_k[:, None] > 0.0, dr[:, None] * (k / l2_k[:, None]), 0.0)
+                tl.store(dq_ptr + offsets_m[:, None] * stride_dqm + offsets_d[None, :] * stride_dqk, dQ_block.to(dQ.dtype.element_ty), mask=mask_m[:, None])
+                tl.store(dk_ptr + offsets_m[:, None] * stride_dkm + offsets_d[None, :] * stride_dkk, dK_block.to(dK.dtype.element_ty), mask=mask_m[:, None])
 
-        # Pass 3: propagate dc through V via swiglu with global dv_sw = sum_dc_global
-        for start_m in range(0, seq_len, BLOCK_SIZE_M):
-            offsets_m = start_m + tl.arange(0, BLOCK_SIZE_M)
-            mask_m = offsets_m < seq_len
-            v = tl.load(v_ptr + offsets_m[:, None] * stride_vm + offsets_d[None, :] * stride_vk, mask=mask_m[:, None], other=0.0).to(DTYPE)
-            sig_v = tl.sigmoid(v)
-            v_silu = v * sig_v
-            dsilu_v = sig_v * (1.0 + v * (1.0 - sig_v))
-            dv_from_vsw = sum_dc_global[None, :] * (dsilu_v * v + v_silu)
+            # Pass 3: propagate dc through V via swiglu with global dv_sw = sum_dc_global
+            for start_m in range(0, seq_len, BLOCK_SIZE_M):
+                offsets_m = start_m + tl.arange(0, BLOCK_SIZE_M)
+                mask_m = offsets_m < seq_len
+                v = tl.load(v_ptr + offsets_m[:, None] * stride_vm + offsets_d[None, :] * stride_vk, mask=mask_m[:, None], other=0.0).to(DTYPE)
+                sig_v = tl.sigmoid(v)
+                v_silu = v * sig_v
+                dsilu_v = sig_v * (1.0 + v * (1.0 - sig_v))
+                dv_from_vsw = sum_dc_global[None, :] * (dsilu_v * v + v_silu)
 
-            dv_prev = tl.load(dv_ptr + offsets_m[:, None] * stride_dvm + offsets_d[None, :] * stride_dvk, mask=mask_m[:, None], other=0.0)
-            dV_block = dv_prev + dv_from_vsw
-            tl.store(dv_ptr + offsets_m[:, None] * stride_dvm + offsets_d[None, :] * stride_dvk, dV_block.to(dV.dtype.element_ty), mask=mask_m[:, None])
+                dv_prev = tl.load(dv_ptr + offsets_m[:, None] * stride_dvm + offsets_d[None, :] * stride_dvk, mask=mask_m[:, None], other=0.0)
+                dV_block = dv_prev + dv_from_vsw
+                tl.store(dv_ptr + offsets_m[:, None] * stride_dvm + offsets_d[None, :] * stride_dvk, dV_block.to(dV.dtype.element_ty), mask=mask_m[:, None])
 
 
 if _TRITON_AVAILABLE:
