@@ -21,14 +21,12 @@ Windows users: Triton is primarily supported on Linux. Use WSL2 for best results
 import torch
 from evo_attn import EvoAttention, evo_attention
 
-# Pre-projected tensors (B, H, L, D)
+# Pass only Value (B, H, L, D); all projections/gating live inside
 B, H, L, D = 2, 8, 4096, 64
-q = torch.randn(B, H, L, D, device='cuda')
-k = torch.randn(B, H, L, D, device='cuda')
 v = torch.randn(B, H, L, D, device='cuda')
-y = evo_attention(q, k, v, causal=True)
+y = evo_attention(v, causal=True)
 
-# Module with Q/K/V projections (drop-in block)
+# Module API (B, L, E) → (B, L, E)
 E = H * D
 x = torch.randn(B, L, E, device='cuda')
 layer = EvoAttention(embed_dim=E, num_heads=H).cuda()
@@ -38,14 +36,21 @@ y2 = layer(x, causal=True)
 ### Features
 
 - Causal and non-causal modes
-- Triton kernels with numerically stable reductions and compensated prefix-sums
+- Prefix-sum kernels in Triton; rest under the hood with fast cuBLAS/cuDNN
+- Pass only Value; Q/K projections and gating handled internally
 - Automatic Torch fallback when Triton/CUDA is unavailable
 - Optional `attention_mask` for padded tokens
-- Supports fp16/bf16/fp32 inputs; controlled accumulation precision
+- Supports fp16/bf16/fp32 inputs
+
+### Runtime controls
+
+- `EVO_BACKEND=auto|triton|torch` — prefer Triton, Torch, or auto-detect (default: `auto`)
+- `EVO_AUTOTUNE=1` — enable one-off tuning of prefix-sum launch params (cached)
+- `accum_dtype` — pass `torch.float64` to causal path for highest numerical stability where supported
 
 ### API
 
-- `evo_attention(q, k, v, causal=True, attention_mask=None, accum_dtype=None, block_m=None, num_warps=None, num_stages=None)` → `(B,H,L,D)`
+- `evo_attention(v, causal=True, attention_mask=None, accum_dtype=None, block_m=None, num_warps=None, num_stages=None)` → `(B,H,L,D)`
 - `EvoAttention(embed_dim, num_heads, bias=False, out_proj=True)` → module for `(B,L,E)` → `(B,L,E)`
 
 ### Benchmarks

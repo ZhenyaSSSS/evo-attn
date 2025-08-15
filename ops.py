@@ -2,6 +2,8 @@ import torch
 import torch.nn as nn
 
 from .evo_causal import EvoAttentionCausalTriton, EvoAttentionCausalTorch
+import os
+import warnings
 
 
 def _apply_attention_mask(q: torch.Tensor, k: torch.Tensor, v: torch.Tensor, attention_mask: torch.Tensor | None) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
@@ -23,8 +25,6 @@ def _apply_attention_mask(q: torch.Tensor, k: torch.Tensor, v: torch.Tensor, att
 
 
 def evo_attn(
-    q: torch.Tensor,
-    k: torch.Tensor,
     v: torch.Tensor,
     *,
     causal: bool = True,
@@ -35,57 +35,59 @@ def evo_attn(
     num_stages: int | None = None,
 ) -> torch.Tensor:
     """
-    Functional EvoAttention core operating on pre-projected tensors shaped (B, H, L, D).
-
-    - q, k, v: tensors of shape (batch, heads, seq_len, head_dim)
-    - causal: whether to apply causal prefix accumulation
-    - attention_mask: optional mask with 1.0 for valid tokens; shapes supported: (B,L), (B,1,L), (B,1,L,1)
-    - accum_dtype: optional accumulation dtype control (e.g., torch.float64)
-    - block_m/num_warps/num_stages: low-level Triton tuning hints
+    Functional EvoAttention core operating only on Value tensor (B, H, L, D).
+    All projections and gating live under the hood.
     """
-    if q.dim() != 4 or k.dim() != 4 or v.dim() != 4:
-        raise ValueError("q, k, v must have shape (B, H, L, D)")
-    if q.shape != k.shape or q.shape != v.shape:
-        raise ValueError("q, k, v must have the same shape")
+    if v.dim() != 4:
+        raise ValueError("v must have shape (B, H, L, D)")
 
+    # For compatibility, masking still accepted
     if attention_mask is not None:
-        q, k, v = _apply_attention_mask(q, k, v, attention_mask)
+        v = _apply_attention_mask(v, v, v, attention_mask)[2]
 
-    core = EvoAttentionCausalTriton()
-    return core(
-        q,
-        k,
-        v,
-        causal=causal,
-        accum_dtype=accum_dtype,
-        block_m=block_m,
-        num_warps=num_warps,
-        num_stages=num_stages,
-    )
+    # Internally, Q=K=V as placeholder; projections done inside the core
+    backend = os.getenv("EVO_BACKEND", "auto").lower()
+    triton_ok = hasattr(EvoAttentionCausalTriton, "forward")
+    if backend == "torch" or (backend == "auto" and not triton_ok):
+        core = EvoAttentionCausalTorch()
+    else:
+        try:
+            core = EvoAttentionCausalTriton()
+        except Exception as e:
+            warnings.warn(f"Falling back to Torch backend due to Triton init error: {e}")
+            core = EvoAttentionCausalTorch()
+    # Core supports V-only call; single-tensor interface
+    return core(v, causal=causal, accum_dtype=accum_dtype, block_m=block_m, num_warps=num_warps, num_stages=num_stages)
 
 
 class EvoAttn(nn.Module):
     """
-    Drop-in attention-like block with Q/K/V linear projections using EvoAttention core.
-
-    Input shape: (B, L, E)
-    Output shape: (B, L, E)
+    High-level module: user passes only Value embedding (B, L, E),
+    all linear projections and gating live inside the core.
     """
 
-    def __init__(self, embed_dim: int, num_heads: int, *, bias: bool = False, out_proj: bool = True):
+    def __init__(self, embed_dim: int, num_heads: int, *, head_dim: int | None = None, bias: bool = False, out_proj: bool = True):
         super().__init__()
-        if embed_dim % num_heads != 0:
-            raise ValueError("embed_dim must be divisible by num_heads")
+        if head_dim is None and embed_dim % num_heads != 0:
+            raise ValueError("embed_dim must be divisible by num_heads when head_dim is None")
         self.embed_dim = embed_dim
         self.num_heads = num_heads
-        self.head_dim = embed_dim // num_heads
+        self.head_dim = (embed_dim // num_heads) if head_dim is None else head_dim
+        if head_dim is not None and self.num_heads * self.head_dim != self.embed_dim:
+            raise ValueError("num_heads * head_dim must equal embed_dim when head_dim is provided")
 
-        self.q_proj = nn.Linear(embed_dim, embed_dim, bias=bias)
-        self.k_proj = nn.Linear(embed_dim, embed_dim, bias=bias)
-        self.v_proj = nn.Linear(embed_dim, embed_dim, bias=bias)
-        self.out_proj = nn.Linear(embed_dim, embed_dim) if out_proj else nn.Identity()
+        # Projections are handled inside the core; keep an Identity for output for API symmetry
+        self.out_proj = nn.Identity()
 
-        self.core = EvoAttentionCausalTriton()
+        backend = os.getenv("EVO_BACKEND", "auto").lower()
+        try:
+            if backend == "torch":
+                self.core = EvoAttentionCausalTorch()
+            else:
+                self.core = EvoAttentionCausalTriton()
+        except Exception as e:
+            warnings.warn(f"Falling back to Torch backend due to Triton init error: {e}")
+            self.core = EvoAttentionCausalTorch()
         self.ref = EvoAttentionCausalTorch()
 
     def forward(
@@ -103,22 +105,12 @@ class EvoAttn(nn.Module):
             raise ValueError("x must have shape (B, L, E)")
         batch, seq_len, _ = x.shape
 
-        q = self.q_proj(x).view(batch, seq_len, self.num_heads, self.head_dim).transpose(1, 2)
-        k = self.k_proj(x).view(batch, seq_len, self.num_heads, self.head_dim).transpose(1, 2)
-        v = self.v_proj(x).view(batch, seq_len, self.num_heads, self.head_dim).transpose(1, 2)
+        v = x.view(batch, seq_len, self.num_heads, self.head_dim).transpose(1, 2)
+        if attention_mask is not None:
+            v = _apply_attention_mask(v, v, v, attention_mask)[2]
 
-        q, k, v = _apply_attention_mask(q, k, v, attention_mask)
-
-        y = self.core(
-            q,
-            k,
-            v,
-            causal=causal,
-            accum_dtype=accum_dtype,
-            block_m=block_m,
-            num_warps=num_warps,
-            num_stages=num_stages,
-        )
+        # Core handles Q/K/V internally; single-tensor call
+        y = self.core(v, causal=causal, accum_dtype=accum_dtype, block_m=block_m, num_warps=num_warps, num_stages=num_stages)
         y = y.transpose(1, 2).contiguous().view(batch, seq_len, self.embed_dim)
         return self.out_proj(y)
 
